@@ -4685,19 +4685,26 @@ static void genMetadirective(lower::AbstractConverter &converter,
   fir::FirOpBuilder &builder = converter.getFirOpBuilder();
 
   llvm::SmallVector<llvm::omp::TraitProperty, 8> constructTraits;
-  for (auto *parentEval = eval.parentConstruct; parentEval;
-       parentEval = parentEval->parentConstruct) {
-    const auto *ompConstruct = parentEval->getIf<parser::OpenMPConstruct>();
-    if (!ompConstruct)
-      continue;
-    llvm::omp::Directive dir =
-        parser::omp::GetOmpDirectiveName(*ompConstruct).v;
-    appendConstructTraits(dir, constructTraits);
-  }
+  // Collect enclosing OpenMP operations so variants chosen by an outer
+  // metadirective are part of this metadirective's context. For example, an
+  // inner metadirective inside `target` and an outer-selected `parallel` must
+  // be able to match construct={target, parallel}.
+  for (mlir::Operation *op = builder.getInsertionBlock()->getParentOp(); op;
+       op = op->getParentOp())
+    appendConstructTraits(op, constructTraits);
+
+  // Fall back to lexical PFT parents when lowering has no enclosing OpenMP
+  // operation representing the source-level construct context.
   if (constructTraits.empty()) {
-    for (mlir::Operation *op = builder.getInsertionBlock()->getParentOp(); op;
-         op = op->getParentOp())
-      appendConstructTraits(op, constructTraits);
+    for (auto *parentEval = eval.parentConstruct; parentEval;
+         parentEval = parentEval->parentConstruct) {
+      const auto *ompConstruct = parentEval->getIf<parser::OpenMPConstruct>();
+      if (!ompConstruct)
+        continue;
+      llvm::omp::Directive dir =
+          parser::omp::GetOmpDirectiveName(*ompConstruct).v;
+      appendConstructTraits(dir, constructTraits);
+    }
   }
   std::reverse(constructTraits.begin(), constructTraits.end());
   TargetOMPContext ompCtx(builder.getModule(), constructTraits);
