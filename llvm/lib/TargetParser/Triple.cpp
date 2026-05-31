@@ -640,7 +640,7 @@ StringRef Triple::getObjectFormatTypeName(ObjectFormatType Kind) {
     return "xcoff";
   case DXContainer:
     return "dxcontainer";
-  case MetalLib:
+  case AIRLib:
     return "metallib";
   case SPIRV:
     return "spirv";
@@ -898,6 +898,11 @@ Triple::ArchType Triple::parseArch(StringRef ArchName) {
       return parseARMArch(ArchName);
     if (ArchName.starts_with("bpf"))
       return parseBPFArch(ArchName);
+    // Apple AIR (AIR) triples carry a versioned subarch, e.g.
+    // "air64_v26-apple-macosx26"; match the family by prefix so the OS
+    // component survives target lookup.
+    if (ArchName.starts_with("air64"))
+      return Triple::air;
   }
 
   return AT;
@@ -1049,7 +1054,7 @@ static Triple::ObjectFormatType parseFormat(StringRef EnvironmentName) {
       .EndsWith("macho", Triple::MachO)
       .EndsWith("wasm", Triple::Wasm)
       .EndsWith("spirv", Triple::SPIRV)
-      .EndsWith("metallib", Triple::MetalLib)
+      .EndsWith("metallib", Triple::AIRLib)
       .Default(Triple::UnknownObjectFormat);
 }
 
@@ -1285,7 +1290,7 @@ static Triple::ObjectFormatType getDefaultFormat(const Triple &T) {
     return Triple::DXContainer;
 
   case Triple::air:
-    return Triple::MetalLib;
+    return Triple::AIRLib;
   }
   llvm_unreachable("unknown architecture");
 }

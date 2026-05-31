@@ -596,7 +596,7 @@ set(LLVM_ALL_EXPERIMENTAL_TARGETS
   CSKY
   DirectX
   M68k
-  Metal
+  AIR
   Xtensa
 )
 
