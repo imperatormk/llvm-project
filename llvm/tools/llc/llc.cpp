@@ -87,6 +87,12 @@ static cl::opt<std::string> OutputFilename("o", cl::desc("Output filename"),
                                            cl::value_desc("filename"));
 
 static cl::opt<std::string>
+    TGBytesOut("tg-bytes-out",
+               cl::desc("Write threadgroup memory total (bytes, post-pass) "
+                        "to this file"),
+               cl::init(""));
+
+static cl::opt<std::string>
     SplitDwarfOutputFile("split-dwarf-output", cl::desc(".dwo output filename"),
                          cl::value_desc("filename"));
 
@@ -878,6 +884,27 @@ static int compileModule(char **argv, SmallVectorImpl<PassPlugin> &PluginList,
     }
 
     PM.run(*M);
+
+    if (!TGBytesOut.empty()) {
+      const DataLayout &TGDL = M->getDataLayout();
+      uint64_t TGTotal = 0;
+      for (const GlobalVariable &GV : M->globals()) {
+        if (GV.getAddressSpace() != 3 || GV.isDeclaration())
+          continue;
+        uint64_t AlignB = GV.getAlign().value_or(Align(1)).value();
+        if (TGTotal % AlignB)
+          TGTotal += AlignB - (TGTotal % AlignB);
+        TGTotal += TGDL.getTypeAllocSize(GV.getValueType());
+      }
+      std::error_code TGEC;
+      raw_fd_ostream TGOut(TGBytesOut, TGEC, sys::fs::OF_Text);
+      if (TGEC) {
+        WithColor::error(errs(), argv0)
+            << "cannot open tg-bytes-out: " << TGEC.message() << '\n';
+        return 1;
+      }
+      TGOut << TGTotal << '\n';
+    }
 
     if (Context.getDiagHandlerPtr()->HasErrors || HasMCErrors)
       return 1;
