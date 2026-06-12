@@ -103,6 +103,8 @@
 #include "mlir/Dialect/XeGPU/IR/XeGPU.h"
 #include "mlir/IR/Dialect.h"
 #include "mlir/Interfaces/CastInterfaces.h"
+#include "mlir/Dialect/AIR/IR/AIRDialect.h"
+#include "mlir/Target/LLVM/AIR/Target.h"
 #include "mlir/Target/LLVM/NVVM/Target.h"
 #include "mlir/Target/LLVM/ROCDL/Target.h"
 #include "mlir/Target/LLVM/XeVM/Target.h"
@@ -113,6 +115,7 @@ void mlir::registerAllDialects(DialectRegistry &registry) {
   // clang-format off
   registry.insert<acc::OpenACCDialect,
                   affine::AffineDialect,
+                  air::AIRDialect,
                   amdgpu::AMDGPUDialect,
                   arith::ArithDialect,
                   arm_neon::ArmNeonDialect,
@@ -203,6 +206,7 @@ void mlir::registerAllDialects(DialectRegistry &registry) {
   vector::registerIndexedAccessOpInterfaceExternalModels(registry);
   vector::registerSubsetOpInterfaceExternalModels(registry);
   vector::registerValueBoundsOpInterfaceExternalModels(registry);
+  air::registerAIRTargetInterfaceExternalModels(registry);
   NVVM::registerNVVMTargetInterfaceExternalModels(registry);
   ROCDL::registerROCDLTargetInterfaceExternalModels(registry);
   spirv::registerSPIRVTargetInterfaceExternalModels(registry);
