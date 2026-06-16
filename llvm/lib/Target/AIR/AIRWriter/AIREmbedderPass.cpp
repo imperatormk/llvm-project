@@ -32,6 +32,7 @@
 #include "llvm/Support/Alignment.h"
 #include "llvm/Transforms/Utils/ModuleUtils.h"
 #include <cstdint>
+#include <cstdlib>
 #include <vector>
 
 using namespace llvm;
@@ -81,7 +82,10 @@ static void embedAIRLibImpl(Module &M) {
   metal::lowerConstantExprs(M);
   metal::PointeeTypeMap PTM = metal::buildPointeeTypeMap(M);
   emitTGBytesRemark(M);
-  std::vector<uint8_t> Bytes = metal::serializeAIRLib(M, PTM);
+  metal::AIRLibOptions Opts;
+  if (const char *E = ::getenv("AIR_OPAQUE_PTRS"))
+    Opts.OpaquePointers = StringRef(E) == "1";
+  std::vector<uint8_t> Bytes = metal::serializeAIRLib(M, PTM, Opts);
 
   ArrayRef<uint8_t> Ref(Bytes.data(), Bytes.size());
   Constant *Init = ConstantDataArray::get(M.getContext(), Ref);

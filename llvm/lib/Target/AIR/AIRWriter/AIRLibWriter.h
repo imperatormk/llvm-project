@@ -40,6 +40,7 @@ struct AIRLibOptions {
   uint16_t OSPatch = 0;
   uint16_t AIRMajor = DefaultAIRLangMajor;
   uint16_t AIRMinor = DefaultAIRLangMinor;
+  bool OpaquePointers = false;
 };
 
 // Write the module as a metallib to the output stream.

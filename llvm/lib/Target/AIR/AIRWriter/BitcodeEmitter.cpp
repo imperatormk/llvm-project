@@ -310,6 +310,54 @@ static void fixPhiIncomingTypes(Module &M, PointeeTypeMap &PTM) {
 // Shape 4 (normalizeArrayGlobalGEPs) is deliberately NOT folded in here: it
 // must run LATER, after lowerConstantExprs materializes constexpr GEPs. It
 // stays a separate call at its current call site.
+// Opaque/v2: the MetalIR v29 reader strides a single-index `[N x i8]` array GEP
+// by the consuming load/store's value type, not by the array's own alloc size —
+// so `gep [4 x i8], ptr, %i` feeding a `load <8 x float>` strides 32 bytes per
+// %i instead of 4, reading the wrong elements (the cast/dot miscompiles). The
+// typed path side-steps this by base-bitcasting to `[N x i8]*`, unavailable
+// under opaque. Rewrite every constant-element-size array/vector GEP source to
+// flat `i8` with the index pre-multiplied by the element alloc size, so the
+// reader strides by 1 byte and the arithmetic is explicit and unambiguous.
+static void linearizeGEPsToBytes(Module &M) {
+  const DataLayout &DL = M.getDataLayout();
+  Type *I8 = Type::getInt8Ty(M.getContext());
+  for (auto &F : M) {
+    if (F.isDeclaration())
+      continue;
+    SmallVector<GetElementPtrInst *, 16> ToFix;
+    for (auto &BB : F)
+      for (auto &I : BB)
+        if (auto *GEP = dyn_cast<GetElementPtrInst>(&I)) {
+          if (GEP->getNumIndices() != 1)
+            continue;
+          Type *SrcTy = GEP->getSourceElementType();
+          if (SrcTy->isIntegerTy(8))
+            continue;
+          if (!isa<ArrayType>(SrcTy) && !isa<VectorType>(SrcTy))
+            continue;
+          if (!SrcTy->isSized() || DL.getTypeAllocSize(SrcTy).isScalable())
+            continue;
+          // Array-global (threadgroup smem) GEPs must keep their array element
+          // type — the reader pairs `[N x T]*` globals with `[N x T]` GEPs.
+          if (isa<GlobalVariable>(GEP->getPointerOperand()->stripPointerCasts()))
+            continue;
+          ToFix.push_back(GEP);
+        }
+    for (auto *GEP : ToFix) {
+      uint64_t Stride =
+          DL.getTypeAllocSize(GEP->getSourceElementType()).getFixedValue();
+      IRBuilder<> B(GEP);
+      Value *Idx = B.CreateSExtOrTrunc(GEP->getOperand(1), B.getInt64Ty());
+      Value *ByteOff = B.CreateMul(Idx, B.getInt64(Stride));
+      auto *NewGEP = cast<GetElementPtrInst>(
+          B.CreateGEP(I8, GEP->getPointerOperand(), ByteOff));
+      NewGEP->setIsInBounds(GEP->isInBounds());
+      GEP->replaceAllUsesWith(NewGEP);
+      GEP->eraseFromParent();
+    }
+  }
+}
+
 static void normalizeGEPs(Module &M, PointeeTypeMap &PTM) {
   auto &Ctx = M.getContext();
   Type *FloatTy = Type::getFloatTy(Ctx);
@@ -968,6 +1016,87 @@ static void fixAccessTypeMismatch(Module &M, PointeeTypeMap &PTM) {
   }
 }
 
+// A simdgroup-matrix load/store pointer operand that is an array-typed GEP into
+// a threadgroup global (getelementptr [N x T], ptr, 0, idx) leaves an opaque
+// pointer whose element type Apple's SimdMatrixLoadStorePass cannot recover ->
+// null-deref. Apple's own opaque codegen feeds these intrinsics a scalar-element
+// GEP (getelementptr T, ptr, idx); rewrite to match so the reader derives the
+// scalar pointee.
+static void scalarizeMMAGlobalGEPsOpaque(Module &M) {
+  auto &Ctx = M.getContext();
+  Type *I64 = Type::getInt64Ty(Ctx);
+  auto Calls = collectInsts<CallInst>(M, [](CallInst *CI) {
+    if (!CI->getCalledFunction())
+      return false;
+    StringRef N = CI->getCalledFunction()->getName();
+    return N.starts_with("air.simdgroup_matrix_8x8_load") ||
+           N.starts_with("air.simdgroup_matrix_8x8_store");
+  });
+  for (auto *CI : Calls) {
+    for (unsigned J = 0; J < CI->arg_size(); J++) {
+      Value *Op = CI->getArgOperand(J);
+      if (!Op->getType()->isPointerTy())
+        continue;
+      Type *Elem = nullptr;
+      Value *Base = nullptr;
+      Value *Idx = nullptr;
+      if (auto *GV = dyn_cast<GlobalVariable>(Op)) {
+        if (auto *AT = dyn_cast<ArrayType>(GV->getValueType()))
+          if (AT->getElementType()->isFloatingPointTy()) {
+            Elem = AT->getElementType();
+            Base = GV;
+            Idx = ConstantInt::get(I64, 0);
+          }
+      } else if (auto *GEP = dyn_cast<GetElementPtrInst>(Op)) {
+        if (auto *AT = dyn_cast<ArrayType>(GEP->getSourceElementType()))
+          if (AT->getElementType()->isFloatingPointTy()) {
+            Elem = AT->getElementType();
+            Base = GEP->getPointerOperand();
+            Idx = GEP->getOperand(GEP->getNumOperands() - 1);
+          }
+      }
+      if (!Elem)
+        continue;
+      auto *NewGEP = GetElementPtrInst::Create(Elem, Base, {Idx}, "",
+                                               CI->getIterator());
+      NewGEP->setIsInBounds(true);
+      CI->setArgOperand(J, NewGEP);
+    }
+  }
+}
+
+static void stripMMAPointerElemSuffixOpaque(Module &M) {
+  SmallVector<Function *, 8> Targets;
+  for (auto &F : M) {
+    StringRef Name = F.getName();
+    if (!Name.starts_with("air.simdgroup_matrix_8x8_load") &&
+        !Name.starts_with("air.simdgroup_matrix_8x8_store"))
+      continue;
+    Targets.push_back(&F);
+  }
+  for (auto *F : Targets) {
+    StringRef Name = F->getName();
+    size_t PPos = Name.rfind(".p");
+    if (PPos == StringRef::npos)
+      continue;
+    size_t D = PPos + 2;
+    size_t E = D;
+    while (E < Name.size() && Name[E] >= '0' && Name[E] <= '9')
+      E++;
+    if (E == D || E == Name.size())
+      continue;
+    std::string NewName = (Name.substr(0, E)).str();
+    if (NewName == Name.str())
+      continue;
+    if (Function *Existing = M.getFunction(NewName)) {
+      F->replaceAllUsesWith(Existing);
+      F->eraseFromParent();
+    } else {
+      F->setName(NewName);
+    }
+  }
+}
+
 // Identity-bitcast a simdgroup-matrix intrinsic's pointer arg so its pointee
 // matches the intrinsic's element suffix. A float-typed TG/device pointer
 // passed straight into a p3f16/p1f16 load (or any suffix mismatch) emits an
@@ -1391,7 +1520,8 @@ static void normalizeArrayGlobalGEPs(Module &M) {
   }
 }
 
-std::vector<uint8_t> emitAIRBitcode(Module &M, PointeeTypeMap &PTM) {
+std::vector<uint8_t> emitAIRBitcode(Module &M, PointeeTypeMap &PTM,
+                                    bool OpaquePointers) {
   SmallVector<char, 0> Buf;
   {
     BitstreamWriter W(Buf);
@@ -1404,7 +1534,7 @@ std::vector<uint8_t> emitAIRBitcode(Module &M, PointeeTypeMap &PTM) {
 
     // IDENTIFICATION
     W.EnterSubblock(bitc::IDENTIFICATION_BLOCK_ID, 5);
-    emitString(W, bitc::IDENTIFICATION_CODE_STRING, "AIRIR");
+    emitString(W, bitc::IDENTIFICATION_CODE_STRING, OpaquePointers ? "" : "AIRIR");
     {
       SmallVector<uint64_t, 1> V = {0};
       W.EmitRecord(bitc::IDENTIFICATION_CODE_EPOCH, V);
@@ -1425,7 +1555,7 @@ std::vector<uint8_t> emitAIRBitcode(Module &M, PointeeTypeMap &PTM) {
     //   D. Materialize ConstantExprs, then the post-constexpr GEP shape 4 and
     //      kernel-arg metadata.
     //
-    // --- Stage A: legalize / lower ---
+    // --- Stage A: legalize / lower (value-level, pointer-model-agnostic) ---
     expandWideIntegers(M);
     lowerFreezeInsts(M);
     canonicalizeNNegZExt(M);
@@ -1434,32 +1564,64 @@ std::vector<uint8_t> emitAIRBitcode(Module &M, PointeeTypeMap &PTM) {
     lowerVectorPointerToInt(M);
     // scalarizeVectorSelects(M); // disabled for now
     lowerVectorSelects(M);
-    removeRedundantBitcasts(M, PTM);
-    // --- Stage B: GEP source-type normalization ---
-    // Shapes 1-3 (see normalizeGEPs). Runs after the Stage-A passes that
-    // create new GEPs and before the Stage-C fixups that read GEP result types.
-    normalizeGEPs(M, PTM);
-    // --- Stage C: pointer-pointee type agreement ---
-    fixPhiIncomingTypes(M, PTM);
-    fixMMAPointerSuffixMismatch(M, PTM);
-    scalarizeAggregateLoads(M);
-    fixAccessTypeMismatch(M, PTM);
 
-    // --- Stage D: materialize constexprs, then post-constexpr fixups ---
-    // Lower ConstantExpr operands to real instructions before enumeration.
+    if (!OpaquePointers) {
+      removeRedundantBitcasts(M, PTM);
+      // --- Stage B: GEP source-type normalization (shapes 1-3) ---
+      normalizeGEPs(M, PTM);
+      // --- Stage C: pointer-pointee type agreement ---
+      fixPhiIncomingTypes(M, PTM);
+      fixMMAPointerSuffixMismatch(M, PTM);
+      scalarizeAggregateLoads(M);
+      fixAccessTypeMismatch(M, PTM);
+    } else {
+      linearizeGEPsToBytes(M);
+      scalarizeAggregateLoads(M);
+      stripMMAPointerElemSuffixOpaque(M);
+      scalarizeMMAGlobalGEPsOpaque(M);
+    }
+
+    // --- Stage D: materialize constexprs (value-level), then pointee fixups ---
     lowerConstantExprs(M);
-    normalizeArrayGlobalGEPs(M);
-
-    // Fix kernel argument metadata to match actual pointee types.
+    if (!OpaquePointers) {
+      normalizeArrayGlobalGEPs(M);
+    }
     fixKernelArgMetadata(M, PTM);
 
-    ValueEnumerator E(M, PTM);
+    // Opaque/v2 needs the air.version bumped to 2.9.0 (opaque-native) so the
+    // MetalIR reader takes the native parse path instead of the failing upgrade.
+    if (OpaquePointers) {
+      auto &Ctx = M.getContext();
+      Type *I32 = Type::getInt32Ty(Ctx);
+      auto MDI32 = [&](unsigned V) {
+        return ConstantAsMetadata::get(ConstantInt::get(I32, V));
+      };
+      if (auto *NMD = M.getNamedMetadata("air.version")) {
+        NMD->clearOperands();
+        NMD->addOperand(MDNode::get(Ctx, {MDI32(2), MDI32(9), MDI32(0)}));
+      }
+    }
+
+    ValueEnumerator E(M, PTM, OpaquePointers);
+
+    // v2 string table: function/global names live in a top-level STRTAB blob,
+    // referenced by (offset,size) prepended to the FUNCTION/GLOBALVAR records.
+    // Built up while emitting those records, flushed after the module block.
+    std::string Strtab;
+    auto addToStrtab = [&](StringRef S) -> uint64_t {
+      size_t Off = Strtab.find(S);
+      if (Off == std::string::npos) {
+        Off = Strtab.size();
+        Strtab.append(S.begin(), S.end());
+      }
+      return Off;
+    };
 
     // MODULE_BLOCK (CodeSize=4)
     W.EnterSubblock(bitc::MODULE_BLOCK_ID, 4);
 
     {
-      SmallVector<uint64_t, 1> V = {1};
+      SmallVector<uint64_t, 1> V = {OpaquePointers ? 2u : 1u};
       W.EmitRecord(bitc::MODULE_CODE_VERSION, V);
     }
 
@@ -1697,6 +1859,11 @@ std::vector<uint8_t> emitAIRBitcode(Module &M, PointeeTypeMap &PTM) {
         // (falls back to macOS 16 / 26-era), rather than hardcoding it.
         T = metal::AIRVersion::fromTriple(M.getTargetTriple().str())
                 .tripleString();
+      // Opaque pointers are native to air.version 2.9 (air64_v29); emitting an
+      // older subarch makes the MetalIR reader run the typed->opaque upgrade
+      // path, which fails ("Failed to upgrade function bitcode").
+      if (OpaquePointers)
+        T = metal::AIRVersion::fromOSMajor(17).tripleString();
       emitString(W, bitc::MODULE_CODE_TRIPLE, T);
     }
     // Emit data layout - AIR GPU JIT uses this for type size/alignment.
@@ -1722,8 +1889,16 @@ std::vector<uint8_t> emitAIRBitcode(Module &M, PointeeTypeMap &PTM) {
     for (auto *V : E.globalValues) {
       if (auto *G = dyn_cast<GlobalVariable>(V)) {
         SmallVector<uint64_t, 14> Ops;
-        Ops.push_back(E.globalPtrTypeIdx(G)); // ptr-to-valueType
-        Ops.push_back(G->isConstant() ? 1 : 0);
+        if (OpaquePointers) {
+          Ops.push_back(addToStrtab(G->getName()));
+          Ops.push_back(G->getName().size());
+          Ops.push_back(E.typeIdx(G->getValueType()));
+          Ops.push_back((G->isConstant() ? 1u : 0u) | 2u |
+                        (G->getAddressSpace() << 2));
+        } else {
+          Ops.push_back(E.globalPtrTypeIdx(G)); // ptr-to-valueType
+          Ops.push_back(G->isConstant() ? 1 : 0);
+        }
         Ops.push_back(
             G->hasInitializer() ? E.moduleConstIdx(G->getInitializer()) + 1 : 0);
         Ops.push_back(encodeLinkage(G->getLinkage()));
@@ -1739,6 +1914,10 @@ std::vector<uint8_t> emitAIRBitcode(Module &M, PointeeTypeMap &PTM) {
         W.EmitRecord(bitc::MODULE_CODE_GLOBALVAR, Ops);
       } else if (auto *Fn = dyn_cast<Function>(V)) {
         SmallVector<uint64_t, 17> Ops;
+        if (OpaquePointers) {
+          Ops.push_back(addToStrtab(Fn->getName()));
+          Ops.push_back(Fn->getName().size());
+        }
         Ops.push_back(E.typeIdx(Fn->getFunctionType()));
         Ops.push_back(Fn->getCallingConv());
         Ops.push_back(Fn->isDeclaration() ? 1 : 0);
@@ -1764,6 +1943,11 @@ std::vector<uint8_t> emitAIRBitcode(Module &M, PointeeTypeMap &PTM) {
         for (int J = 10; J < 16; J++)
           Ops.push_back(0);
         Ops.push_back(Fn->getAddressSpace());
+        if (OpaquePointers) {
+          Ops.push_back(0); // partition strtab offset
+          Ops.push_back(0); // partition size
+          Ops.push_back(0); // preferred alignment
+        }
         W.EmitRecord(bitc::MODULE_CODE_FUNCTION, Ops);
       }
     }
@@ -1785,20 +1969,36 @@ std::vector<uint8_t> emitAIRBitcode(Module &M, PointeeTypeMap &PTM) {
         if (!F->isDeclaration())
           emitFunctionBlock(W, *F, E, MDEnum);
 
-    // VALUE_SYMTAB
-    W.EnterSubblock(bitc::VALUE_SYMTAB_BLOCK_ID, 4);
-    for (unsigned I = 0; I < E.globalValues.size(); I++) {
-      if (!E.globalValues[I]->hasName())
-        continue;
-      SmallVector<uint64_t, 32> NV;
-      NV.push_back(I);
-      for (char C : E.globalValues[I]->getName())
-        NV.push_back((uint64_t)(unsigned char)C);
-      W.EmitRecord(bitc::VST_CODE_ENTRY, NV);
+    // VALUE_SYMTAB: under v2, names live in the top-level STRTAB and the
+    // module VST is not needed for name resolution.
+    if (!OpaquePointers) {
+      W.EnterSubblock(bitc::VALUE_SYMTAB_BLOCK_ID, 4);
+      for (unsigned I = 0; I < E.globalValues.size(); I++) {
+        if (!E.globalValues[I]->hasName())
+          continue;
+        SmallVector<uint64_t, 32> NV;
+        NV.push_back(I);
+        for (char C : E.globalValues[I]->getName())
+          NV.push_back((uint64_t)(unsigned char)C);
+        W.EmitRecord(bitc::VST_CODE_ENTRY, NV);
+      }
+      W.ExitBlock();
     }
-    W.ExitBlock();
 
     W.ExitBlock(); // MODULE_BLOCK
+
+    // v2 top-level STRTAB blob holding all the names referenced by the
+    // FUNCTION/GLOBALVAR records above.
+    if (OpaquePointers) {
+      W.EnterSubblock(bitc::STRTAB_BLOCK_ID, 3);
+      auto Abbv = std::make_shared<BitCodeAbbrev>();
+      Abbv->Add(BitCodeAbbrevOp(bitc::STRTAB_BLOB));
+      Abbv->Add(BitCodeAbbrevOp(BitCodeAbbrevOp::Blob));
+      unsigned BlobAbbrev = W.EmitAbbrev(std::move(Abbv));
+      SmallVector<uint64_t, 1> Code = {bitc::STRTAB_BLOB};
+      W.EmitRecordWithBlob(BlobAbbrev, Code, StringRef(Strtab));
+      W.ExitBlock();
+    }
   }
 
   return std::vector<uint8_t>(Buf.begin(), Buf.end());

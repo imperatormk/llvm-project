@@ -24,7 +24,8 @@ namespace metal {
 /// instead of opaque pointer records (code 25).
 ///
 /// This replaces LLVM's WriteBitcodeToFile for AIR targets.
-std::vector<uint8_t> emitAIRBitcode(llvm::Module &M, PointeeTypeMap &PTM);
+std::vector<uint8_t> emitAIRBitcode(llvm::Module &M, PointeeTypeMap &PTM,
+                                    bool OpaquePointers = false);
 
 void lowerConstantExprs(llvm::Module &M);
 

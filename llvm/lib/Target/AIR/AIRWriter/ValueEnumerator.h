@@ -68,6 +68,7 @@ public:
   llvm::DenseMap<const llvm::Constant *, unsigned> moduleConstMap;
 
   const PointeeTypeMap &PTM;
+  bool OpaquePointers = false;
   // Inferred pointee types for pointer Types (from first usage seen)
   mutable llvm::DenseMap<llvm::Type *, llvm::Type *> inferredPointee;
 
@@ -83,7 +84,8 @@ public:
   /// this stores the correct type table index for the return type.
   llvm::DenseMap<llvm::FunctionType *, unsigned> funcTypeReturnIndex;
 
-  ValueEnumerator(llvm::Module &M, const PointeeTypeMap &PTM);
+  ValueEnumerator(llvm::Module &M, const PointeeTypeMap &PTM,
+                  bool OpaquePointers = false);
 
   /// Get type index for a non-pointer type.
   unsigned typeIdx(llvm::Type *T);

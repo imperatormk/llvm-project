@@ -112,10 +112,11 @@ static std::string buildEntryTags(StringRef Name, ArrayRef<uint8_t> Hash,
   writeU64(OS, Offt1);
   writeU64(OS, Offt2);
 
-  // VERS (air_major=2, air_minor=8, metal_major, metal_minor)
+  // VERS (air_major=2, air_minor, metal_major, metal_minor). Opaque/v2 is
+  // air.version 2.9 (opaque-native); typed/v1 stays 2.8.
   writeTag(OS, "VERS", 8);
   writeU16(OS, 2);
-  writeU16(OS, 8);
+  writeU16(OS, Opts.OpaquePointers ? 9 : 8);
   writeU16(OS, Opts.AIRMajor);
   writeU16(OS, Opts.AIRMinor);
 
@@ -208,7 +209,7 @@ bool writeAIRLib(Module &M, PointeeTypeMap &PTM, raw_ostream &OS,
   SmallVector<std::string, 4> KernelNames = collectKernelNames(M);
 
   if (KernelNames.empty()) {
-    auto Bitcode = emitAIRBitcode(M, PTM);
+    auto Bitcode = emitAIRBitcode(M, PTM, Opts.OpaquePointers);
     OS.write(reinterpret_cast<const char *>(Bitcode.data()), Bitcode.size());
     return true;
   }
@@ -224,12 +225,12 @@ bool writeAIRLib(Module &M, PointeeTypeMap &PTM, raw_ostream &OS,
   for (size_t I = 0; I < KernelNames.size(); I++) {
     std::vector<uint8_t> Bitcode;
     if (Single) {
-      Bitcode = emitAIRBitcode(M, PTM);
+      Bitcode = emitAIRBitcode(M, PTM, Opts.OpaquePointers);
     } else {
       auto Clone = cloneSingleKernel(M, KernelNames[I], KernelNames);
       lowerConstantExprs(*Clone);
       PointeeTypeMap ClonePTM = buildPointeeTypeMap(*Clone);
-      Bitcode = emitAIRBitcode(*Clone, ClonePTM);
+      Bitcode = emitAIRBitcode(*Clone, ClonePTM, Opts.OpaquePointers);
     }
     auto WrappedBC = wrapBitcode(Bitcode);
     auto Hash = SHA256::hash(ArrayRef<uint8_t>(WrappedBC));

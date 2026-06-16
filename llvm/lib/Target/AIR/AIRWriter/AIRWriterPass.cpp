@@ -18,6 +18,7 @@
 #include "llvm/IR/PassManager.h"
 #include "llvm/Pass.h"
 #include "llvm/Support/raw_ostream.h"
+#include <cstdlib>
 
 using namespace llvm;
 
@@ -67,7 +68,10 @@ static void writeAIRLibImpl(Module &M, raw_pwrite_stream &OS) {
   metal::lowerConstantExprs(M);
   metal::PointeeTypeMap PTM = metal::buildPointeeTypeMap(M);
   emitTGBytesRemark(M);
-  metal::writeAIRLib(M, PTM, OS);
+  metal::AIRLibOptions Opts;
+  if (const char *E = ::getenv("AIR_OPAQUE_PTRS"))
+    Opts.OpaquePointers = StringRef(E) == "1";
+  metal::writeAIRLib(M, PTM, OS, Opts);
 }
 
 PreservedAnalyses AIRWriterPass::run(Module &M, ModuleAnalysisManager &AM) {
