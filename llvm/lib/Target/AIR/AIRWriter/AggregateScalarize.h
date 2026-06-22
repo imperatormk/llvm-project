@@ -1,4 +1,4 @@
-//===- BitcodeEmitter.h - Metal v1 bitcode emitter --------------*- C++ -*-===//
+//===- AggregateScalarize.h - Scalarize aggregate/bool-vec ops --*- C++ -*-===//
 //
 // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
@@ -6,17 +6,20 @@
 //
 //===----------------------------------------------------------------------===//
 
-#ifndef LLVM_LIB_TARGET_AIR_AIRWRITER_BITCODEEMITTER_H
-#define LLVM_LIB_TARGET_AIR_AIRWRITER_BITCODEEMITTER_H
+#ifndef LLVM_LIB_TARGET_AIR_AIRWRITER_AGGREGATESCALARIZE_H
+#define LLVM_LIB_TARGET_AIR_AIRWRITER_AGGREGATESCALARIZE_H
 
 #include "PointeeTypeMap.h"
 #include "llvm/IR/Module.h"
-#include <vector>
 
 namespace llvm {
 namespace metal {
 
-std::vector<uint8_t> emitAIRBitcode(llvm::Module &M, PointeeTypeMap &PTM);
+void scalarizeBoolVectorCasts(Module &M);
+
+void scalarizeAggregateLoads(Module &M, PointeeTypeMap &PTM);
+
+void scalarizeAggregateStores(Module &M, PointeeTypeMap &PTM);
 
 }
 }
